@@ -1,0 +1,11 @@
+# Runtime vault sidecars — contain encrypted secrets, never commit
+vault.*.json
+vault.*.json.tmp
+
+# Built binaries
+/boxcar
+/cmd/boxcar/boxcar
+*.exe
+
+# Go workspace
+/vendor/

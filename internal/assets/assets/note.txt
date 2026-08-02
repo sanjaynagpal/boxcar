@@ -1,0 +1,1 @@
+This file is embedded at compile time via go:embed and is read-only at runtime.
