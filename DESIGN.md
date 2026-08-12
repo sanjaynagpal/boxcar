@@ -86,14 +86,55 @@ vault read/write) end-to-end in-process, including the exact
   different vault's JSON file, or renaming it in place, breaks decryption
   even with the right secret, because the AAD no longer matches what was
   authenticated at seal time.
-- **No plaintext ever touches disk except the user's requested destination**:
-  `extract` decrypts into memory and writes once, with `0600` permissions.
-  `inject` reads plaintext sources into memory, encrypts, and discards the
-  plaintext; only ciphertext is persisted (`vault.<NAME>.json`, also `0600`).
+- **No plaintext file *content* ever touches disk except the user's
+  requested destination**: `extract` decrypts into memory and writes once,
+  with `0600` permissions. `inject` reads plaintext sources into memory,
+  encrypts, and discards the plaintext; only ciphertext is persisted
+  (`vault.<NAME>.json`, also `0600`). This is a guarantee about file
+  *content*, not entry metadata — `Entry.Name` (and now `Entry.OrigName`,
+  the source file's base name at inject time, recorded so
+  `extract <name> <destFolder>` can recreate the exact original file name)
+  are both stored as plaintext JSON fields by design, since they're needed
+  to list and address entries without decrypting anything.
+  `cli.App.inject` sets `OrigName` from `filepath.Base` of the source path;
+  `Vault.Rotate` must copy it onto the freshly-sealed `Entry` explicitly
+  (`SealEntry` has no source-file context to derive it from), or it would
+  silently be lost on every rotation.
+- **Bulk extraction also needs `OrigName`, not just the single-entry path**:
+  `cli.App.extractDir`/`extractParent` reconstruct a destination path from
+  each entry's `Name`, but for a plain, aliased inject (`inject db
+  ./db-password.txt`), `Name` ("db") carries no relation to the real file
+  name at all — only `OrigName` does. `cli.withOrigLeaf(relName, origName)`
+  swaps in `origName` as the final path component while preserving any
+  directory prefix, so a folder-injected entry (whose `Name`'s own leaf
+  already *is* the real file name, e.g. `"alpha/x.txt"`) is unaffected,
+  while a top-level aliased entry extracts under its real name instead of
+  its alias. Both `extractDir` and `extractParent` route their
+  entry-name-to-path construction through it before calling `safeJoin`.
 - **Vault name is a filename component**: `vault.IsValidName` (backed by
   `^[A-Za-z0-9_-]{1,64}$`) is enforced in `cli.parseVaultFlag` before the
   name is ever passed to `Store.PathFor`, so a vault name can't be used for
   path traversal (`../`) or to escape the intended directory.
+- **Entry names are not similarly restricted, so folder extraction guards
+  separately**: `cli.App.injectDir` derives entry names from a source
+  folder's own relative paths (safe by construction), but `Entry.Name` in
+  general has no `vault.IsValidName`-style pattern enforced on it — an entry
+  written by an older version of the tool, or hand-edited into a
+  `vault.*.json`, could contain `../`. `cli.App.extractDir` and
+  `cli.App.extractParent` (which both reconstruct a destination path from an
+  entry's name) call `cli.safeJoin` to reject any name that would resolve
+  outside the destination folder, decrypting every entry before writing any
+  of them so the rejection happens before a partial extract lands on disk.
+- **Folder entry names are namespaced by their source folder ("parent")**:
+  `cli.App.injectDir` names each entry `<srcFolder base>/<relative path>`
+  rather than just `<relative path>`. Without the prefix, injecting two
+  different folders that both happen to contain a same-named file would
+  silently overwrite one via `Vault.Upsert` (which matches on `Entry.Name`
+  alone). The prefix also becomes the selector `cli.App.extractParent`
+  matches against (`strings.HasPrefix(e.Name, parent+"/")`) — it decrypts
+  only the matching entries and strips the prefix back off when writing, so
+  the parent folder's own layout is recreated under the destination rather
+  than nested under a `<parent>/` subdirectory.
 - **Secrets are zeroed after use**: `vault.Zero` overwrites a secret (or a
   derived key) in place once it's no longer needed. `newGCM` (`vault.go`)
   zeroes the scrypt-derived AES key right after `aes.NewCipher` consumes it;
@@ -107,12 +148,21 @@ vault read/write) end-to-end in-process, including the exact
 ## Command dispatch
 
 `cli.App.Run` is a thin switch over `args[0]` after `parseVaultFlag` strips
-an optional leading `-vault`/`--vault` flag (falling back to `$VAULT_NAME`,
-then `"dev"`). It returns an `int` exit code rather than calling `os.Exit`
-directly, which is what makes it callable from tests. Exit codes follow a
-simple convention carried over from the original: `2` for usage/argument
-errors (including an invalid vault name), `1` for a command that ran but
-failed (bad secret, missing entry, unreadable file), `0` for success.
+an optional leading `-vault`/`--vault` flag (falling back to `$VAULT_NAME`).
+It returns an `int` exit code rather than calling `os.Exit` directly, which
+is what makes it callable from tests. Exit codes follow a simple convention
+carried over from the original: `2` for usage/argument errors (including an
+invalid vault name), `1` for a command that ran but failed (bad secret,
+missing entry, unreadable file), `0` for success.
+
+If neither `-vault` nor `$VAULT_NAME` was given, `parseVaultFlag` returns an
+empty name with `explicit=false`, and `Run` (for any command other than
+`vaults`/`assets`, which aren't vault-scoped) resolves the actual name via
+`App.defaultVaultName`: exactly one `vault.*.json` in `Store.Dir` means use
+that vault; zero or more than one means fall back to `"dev"`. This has to
+happen in `Run`, not `parseVaultFlag`, because picking a default requires
+listing the filesystem (`Store.List`) — `parseVaultFlag` only ever looks at
+argv and the environment.
 
 `main.go` is intentionally minimal — it only constructs the real `vault.Store`,
 `terminal.Prompter`, wires stdout/stderr, and calls `os.Exit(app.Run(...))`.

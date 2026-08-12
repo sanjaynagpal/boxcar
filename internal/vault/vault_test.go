@@ -250,6 +250,31 @@ func TestVault_Rotate_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestVault_Rotate_PreservesOrigName(t *testing.T) {
+	var v Vault
+	oldSecret := []byte("correct-secret")
+	newSecret := []byte("brand-new-secret")
+
+	e, err := SealEntry("dev", "db", oldSecret, []byte("content"))
+	if err != nil {
+		t.Fatalf("SealEntry: %v", err)
+	}
+	e.OrigName = "db-password.txt"
+	v.Upsert(e)
+
+	if err := v.Rotate("dev", oldSecret, newSecret); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	got, ok := v.Find("db")
+	if !ok {
+		t.Fatal("entry missing after rotate")
+	}
+	if got.OrigName != "db-password.txt" {
+		t.Fatalf("OrigName after rotate = %q, want %q", got.OrigName, "db-password.txt")
+	}
+}
+
 func TestVault_Rotate_WrongOldSecretLeavesVaultUnmodified(t *testing.T) {
 	var v Vault
 	e, err := SealEntry("dev", "a", []byte("correct-secret"), []byte("content"))

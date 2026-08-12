@@ -29,16 +29,27 @@ Requires Go 1.22+.
 
 ```
 boxcar -vault dev inject db-password ./password.txt   # creates the vault, prompts for a secret
+boxcar -vault dev inject -dir ./secrets/alpha           # inject every file under alpha, recursively;
+                                                          # entries are named "alpha/<relative path>"
 boxcar -vault dev list                                 # see what's in it (never plaintext)
 boxcar -vault dev extract db-password ./restored.txt   # decrypt back out, prompts for the secret
+boxcar -vault dev extract db-password ./restored/       # or drop it into a folder under its
+                                                          # original file name, e.g. ./restored/password.txt
+boxcar -vault dev extract -dir ./restored               # decrypt every entry back into ./restored
+boxcar -vault dev extract -parent alpha ./alpha-bak     # decrypt only "alpha/..." entries into
+                                                          # ./alpha-bak (created if missing), stripping
+                                                          # the "alpha/" prefix
 boxcar -vault dev rotate                                # replace the vault's secret
 boxcar vaults                                           # every vault.*.json on disk
 boxcar assets                                           # files embedded at compile time
 ```
 
-`-vault NAME` selects which vault a command operates on (falls back to
-`$VAULT_NAME`, then `dev`). Vaults are fully isolated from each other —
-each is its own file, its own secret, its own entries.
+`-vault NAME` selects which vault a command operates on, falling back to
+`$VAULT_NAME`; if neither is given and exactly one `vault.*.json` exists in
+the current directory, that vault is used automatically — otherwise (no
+vaults yet, or more than one) it falls back to `dev`. Vaults are fully
+isolated from each other — each is its own file, its own secret, its own
+entries.
 
 ## Security, briefly
 

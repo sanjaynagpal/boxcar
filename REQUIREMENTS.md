@@ -33,6 +33,19 @@ deliberate design requirement, not a limitation to work around.
   `inject <name> <src> [<name> <src> ...]`. All sources are read before any
   write, so a missing file fails before the vault is modified.
 - Re-using an existing entry name replaces that entry in place.
+- A whole folder can be injected at once with `inject -dir <srcFolder>`: every
+  regular file under `srcFolder` (walked recursively) is injected, using
+  `srcFolder`'s own base name (its "parent") joined with the file's path
+  relative to `srcFolder` (slash-separated) as its entry name — e.g.
+  injecting `.../alpha` containing `x.txt` produces the entry `alpha/x.txt`.
+  Recording the parent this way is what keeps two different folders (or a
+  folder and an individually named file) that happen to share a bare file
+  name from colliding on entry name, and is what `extract -parent` later
+  keys off of. This is otherwise identical to the multi-file form — it's
+  implemented in terms of it, so the same
+  read-everything-before-writing-anything and secret-verification guarantees
+  apply. `srcFolder` must already exist and be a directory; otherwise the
+  command fails before prompting for a secret.
 
 ### 3. Extract files with the correct secret
 - A user can extract an entry by name to any destination path.
@@ -41,6 +54,39 @@ deliberate design requirement, not a limitation to work around.
   is no stored password to compare.
 - Decrypted output is written with mode `0600`; parent directories are created
   as needed.
+- Every injected file's original base name (`filepath.Base` of the source
+  path at inject time) is recorded on its entry as plaintext metadata
+  (`Entry.OrigName`, alongside the already-plaintext entry name). If
+  `extract <name> <destPath>` is given a `destPath` that is an *existing
+  directory*, the file is written inside it under that original name instead
+  of requiring `destPath` to already be the exact target file path — so a
+  single file can be extracted back out with its exact original name without
+  the caller needing to know or retype it. A `destPath` that is not an
+  existing directory is still honored literally, as before. This metadata
+  survives `rotate` (which re-seals every entry) and is best-effort for
+  entries that predate it (falls back to the entry's own name).
+- An entire vault can be extracted at once with `extract -dir <destFolder>`:
+  every entry is decrypted into `destFolder`, recreating the entry's name as
+  a path relative to `destFolder` (mirroring how `inject -dir` derived that
+  name), with the final path component replaced by the entry's original
+  source file name when one was recorded — so a top-level entry from a
+  plain, aliased inject (e.g. `inject db ./db-password.txt`) extracts as
+  `destFolder/db-password.txt`, not `destFolder/db`; a folder-injected
+  entry's own name already ends in the real file name, so it's unaffected.
+  `destFolder` must already exist and be a directory; otherwise the
+  command fails before prompting for a secret. Every entry is decrypted
+  before anything is written, so a wrong secret, or an entry name that would
+  resolve outside `destFolder`, is rejected before any file lands on disk.
+- Just the entries from one previously injected folder can be extracted with
+  `extract -parent <name> <destFolder>`: only entries whose name starts with
+  `<name>/` (as produced by `inject -dir`) are decrypted, and that prefix is
+  stripped when writing into `destFolder` — so `extract -parent alpha
+  ./alpha-bak` recreates `alpha`'s own layout under `./alpha-bak`, not
+  `./alpha-bak/alpha/...`. It's an error if no entries match `<name>`.
+  Unlike `-dir`, `destFolder` does not need to already exist — it (and any
+  intermediate directories) is created automatically, since the point is to
+  recreate a folder that may not exist yet. As with `-dir`, every matching
+  entry is decrypted before anything is written.
 
 ### 4. Rotate a vault's secret
 - A user can replace a vault's secret with a new one via `rotate`.
@@ -57,8 +103,12 @@ deliberate design requirement, not a limitation to work around.
 ### 5. Multiple named vaults
 - Any vault name matching `[A-Za-z0-9_-]` (max 64 chars) is allowed — e.g.
   `dev`, `test`, `prod`, `team-a`, `ci`, `staging`.
-- The vault is selected with `-vault NAME`, falling back to `$VAULT_NAME`,
-  then defaulting to `dev`. Vault selection is entirely optional.
+- The vault is selected with `-vault NAME`, falling back to `$VAULT_NAME`.
+  Vault selection is entirely optional: if neither is given, and exactly one
+  `vault.*.json` exists in the store's directory, that vault is used
+  automatically; otherwise (no vaults yet, or more than one — genuinely
+  ambiguous) the long-standing default of `dev` is used. This lookup never
+  runs for `vaults`/`assets`, which aren't scoped to a specific vault.
 - Each vault is an isolated sidecar file `vault.<NAME>.json`. Entries and
   secrets do not cross vaults.
 - The `vaults` command lists every `vault.*.json` on disk with entry counts.
@@ -89,7 +139,10 @@ deliberate design requirement, not a limitation to work around.
 
 ```
 boxcar [-vault NAME] inject <name> <srcFile> [<name> <srcFile> ...]
+boxcar [-vault NAME] inject -dir <srcFolder>
 boxcar [-vault NAME] extract <name> <destPath>
+boxcar [-vault NAME] extract -dir <destFolder>
+boxcar [-vault NAME] extract -parent <name> <destFolder>
 boxcar [-vault NAME] rotate
 boxcar [-vault NAME] list
 boxcar vaults

@@ -109,6 +109,18 @@ type Entry struct {
 	Nonce      []byte `json:"nonce"`      // per-entry GCM nonce
 	Ciphertext []byte `json:"ciphertext"` // AES-GCM sealed bytes (includes auth tag)
 
+	// OrigName is the base name (filepath.Base) of the source file at the
+	// time it was injected, e.g. "password.txt" for a file injected as
+	// `inject db-password ./secrets/password.txt`. It's recorded purely so
+	// a later `extract <name> <destFolder>` can recreate that exact file
+	// name inside destFolder without the caller having to remember or
+	// retype it; it plays no role in encryption (not part of the AEAD
+	// additional data, unlike Name) and, like Name, is stored as plaintext
+	// metadata in vault.<NAME>.json. Empty for entries where no source file
+	// name was recorded (e.g. sealed directly via the vault package, or
+	// written before this field existed).
+	OrigName string `json:"origName,omitempty"`
+
 	// ScryptN, ScryptR, ScryptP are the scrypt cost parameters this entry
 	// was actually sealed with. SealEntry always records the package's
 	// current scryptN/R/P consts here. Entries written before this field
@@ -203,6 +215,7 @@ func (v *Vault) Rotate(env string, oldSecret, newSecret []byte) error {
 		if err != nil {
 			return err
 		}
+		sealed.OrigName = e.OrigName
 		rotated[i] = sealed
 	}
 	v.Entries = rotated
