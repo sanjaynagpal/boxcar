@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/sanjaynagpal/boxcar/internal/assets"
+	"github.com/sanjaynagpal/boxcar/internal/certkey"
 	"github.com/sanjaynagpal/boxcar/internal/vault"
 )
 
@@ -54,10 +55,22 @@ func (a *App) Run(argv []string) int {
 		err = a.listVaults()
 	case "assets":
 		err = a.listAssets()
+	case "cert-gen":
+		if len(args) != 2 {
+			a.usage()
+			return 2
+		}
+		err = a.certGen(args[1])
 	case "list":
 		err = a.listVault(env)
 	case "rotate":
 		err = a.rotate(env)
+	case "cert-wrap":
+		if len(args) != 3 {
+			a.usage()
+			return 2
+		}
+		err = a.certWrap(env, args[1], args[2])
 	case "inject":
 		rest := args[1:]
 		if len(rest) == 2 && rest[0] == "-dir" {
@@ -156,7 +169,7 @@ func (a *App) defaultVaultName() string {
 }
 
 func noVaultCmd(cmd string) bool {
-	return cmd == "vaults" || cmd == "assets"
+	return cmd == "vaults" || cmd == "assets" || cmd == "cert-gen"
 }
 
 func (a *App) usage() {
@@ -192,14 +205,35 @@ func (a *App) usage() {
                                                     destFolder if it doesn't
                                                     exist
   boxcar [-vault NAME] rotate                     re-encrypt all entries under a new secret
+  boxcar [-vault NAME] cert-wrap <certPEM> <outFile>
+                                                    wrap the vault's current
+                                                    secret to an RSA
+                                                    certificate's public key
+                                                    and save it to outFile,
+                                                    for later non-interactive
+                                                    unlocking (see
+                                                    VAULT_KEY_FILE /
+                                                    VAULT_WRAPPED_SECRET
+                                                    below)
   boxcar [-vault NAME] list                       list entries in a vault
   boxcar vaults                                    list all vaults on disk
   boxcar assets                                    list embedded files
+  boxcar cert-gen <outDir>                        generate a self-signed RSA
+                                                    cert/key pair into
+                                                    outDir/cert.pem and
+                                                    outDir/key.pem, for use
+                                                    with cert-wrap below
 
 NAME is any of [A-Za-z0-9_-] (max 64 chars) — e.g. dev, prod, team-a, ci.
 -vault defaults to $VAULT_NAME; if neither is set and exactly one
 vault.*.json exists in the current directory, that vault is used, else
 "dev". Each vault is vault.<NAME>.json.
+
+For non-interactive use (CI, cron, deploy scripts), set both
+$VAULT_KEY_FILE (a PEM-encoded RSA private key) and $VAULT_WRAPPED_SECRET
+(the outFile from a prior cert-wrap) to unlock a vault without a human
+typing its secret. See cert-wrap above to produce that file, and cert-gen
+to produce a certificate if you don't already have one.
 `)
 }
 
@@ -584,6 +618,76 @@ func (a *App) rotate(env string) error {
 		return err
 	}
 	fmt.Fprintf(a.Stdout, "rotated secret for %s (%d entr%s)\n", env, len(v.Entries), plural(len(v.Entries)))
+	return nil
+}
+
+// certGen generates a fresh self-signed RSA certificate/key pair (via
+// certkey.GenerateSelfSigned) and writes them to outDir/cert.pem and
+// outDir/key.pem, creating outDir if it doesn't already exist. The
+// certificate is meant purely as a carrier for the RSA public key used by
+// cert-wrap — it is never validated for trust or expiry by boxcar, so a
+// long, generous validity period is used and nothing here manages
+// renewal. key.pem is written 0600 since, unlike cert.pem, it's the
+// sensitive half of the pair.
+func (a *App) certGen(outDir string) error {
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	certPEM, keyPEM, err := certkey.GenerateSelfSigned("boxcar")
+	if err != nil {
+		return err
+	}
+	certPath := filepath.Join(outDir, "cert.pem")
+	keyPath := filepath.Join(outDir, "key.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "generated self-signed certificate -> %s, %s\n", certPath, keyPath)
+	return nil
+}
+
+// certWrap reads the vault's current secret (via a.Prompter, so this is
+// ordinarily run once, interactively, by whoever knows it — see
+// certkey.Prompter for the non-interactive counterpart used afterward) and
+// verifies it against the vault, then envelope-encrypts it to certPath's
+// public key and writes the result to outFile. That file can later be
+// handed to certkey.Prompter (with the matching private key) so
+// automation — CI, cron, a deploy script — can unlock the vault without a
+// human typing anything.
+func (a *App) certWrap(env, certPath, outFile string) error {
+	v, err := a.Store.Load(env)
+	if err != nil {
+		return err
+	}
+	a.warnLoosePermissions(env)
+	if len(v.Entries) == 0 {
+		return fmt.Errorf("vault %q is empty; inject at least one entry before wrapping its secret", env)
+	}
+
+	secret, err := a.Prompter.Prompt(fmt.Sprintf("Secret [%s]: ", env), false)
+	if err != nil {
+		return err
+	}
+	defer vault.Zero(secret)
+	if err := v.VerifySecret(env, secret); err != nil {
+		return err
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("read certificate %q: %w", certPath, err)
+	}
+	wrapped, err := certkey.WrapSecret(secret, certPEM)
+	if err != nil {
+		return err
+	}
+	if err := wrapped.Save(outFile); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "wrapped %s's secret using %s -> %s\n", env, certPath, outFile)
 	return nil
 }
 

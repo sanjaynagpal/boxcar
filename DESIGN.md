@@ -145,6 +145,80 @@ vault read/write) end-to-end in-process, including the exact
   not a guarantee — Go's runtime can still leave other copies behind (string
   conversions, GC moves) that application code has no handle on to zero.
 
+## Non-interactive secret supply (certificate-wrapped)
+
+`internal/terminal.Prompter` requires a real controlling terminal
+(`term.ReadPassword` needs an actual TTY), so it cannot work at all in CI,
+cron, or a deploy script — there's no human to type anything. `internal/certkey`
+adds a second, structurally-identical `Prompter` (`Prompt(prompt string,
+confirm bool) ([]byte, error)`, satisfied without importing `internal/cli`
+at all, since Go interfaces are structural) that recovers the secret from
+two files instead of a keyboard: a private key, and a secret that was
+pre-wrapped to the matching public key.
+
+- **Envelope encryption, not direct RSA encryption.** `certkey.WrapSecret`
+  does not encrypt the vault secret with RSA directly — RSA-OAEP has a
+  plaintext-size ceiling set by the key's modulus (roughly 190 bytes for a
+  2048-bit key with SHA-256 OAEP), which a passphrase could exceed. Instead,
+  a fresh random AES-256 "data key" is generated per wrap, the actual
+  secret is sealed under it with AES-256-GCM, and only that small,
+  fixed-size data key is wrapped with RSA-OAEP under the certificate's
+  public key — the same pattern cloud KMS "encrypt with a data key" APIs
+  use. This means wrapped-secret length is never limited by the
+  certificate's RSA key size. See `TestWrapUnwrapRoundTrip_LongSecret`.
+- **RSA only, deliberately, for now.** `parseCertPublicKey`/`parsePrivateKey`
+  reject any certificate or key that isn't RSA (`TestWrapSecret_NonRSACertRejected`,
+  `TestUnwrapSecret_NonRSAKeyRejected`) rather than silently mishandling an
+  EC key. EC support (ECIES-style: ephemeral ECDH + HKDF + AES-GCM) was
+  considered and deferred — RSA alone already covers the large majority of
+  X.509 certificates in practice, and adding EC means a second wrap/unwrap
+  code path to implement and test.
+- **`cert-wrap` is a one-time, interactive setup step, not a new secret
+  source of its own.** `cli.App.certWrap` calls `a.Prompter.Prompt(...)`
+  exactly like `inject`/`extract`/`rotate` do — it doesn't know or care
+  whether that's a human at a terminal or (recursively) an already-working
+  `certkey.Prompter`. In the common case it's a human, once, providing the
+  vault's existing secret; `certWrap` verifies it via `Vault.VerifySecret`
+  before wrapping, the same current-secret check `rotate` does, so a wrong
+  secret is rejected before anything is written.
+- **The wrapped-secret file is sensitive but incomplete on its own.**
+  `WrappedSecret.Save` writes `0600`, same as vault files, but recovering
+  the vault secret from it requires *also* possessing the matching RSA
+  private key — this design deliberately does not manage private key
+  storage or distribution itself (a CI secret store, a mounted file with
+  restricted permissions, an HSM are all reasonable places for that key to
+  actually live; see "Considered future enhancements" below for backends
+  that were considered and deferred).
+- **`main.go` selects the `Prompter`, `internal/cli` never does.** Consistent
+  with `cli` depending only on the `Prompter` interface it declares:
+  `cmd/boxcar/main.buildPrompter` reads `$VAULT_KEY_FILE` and
+  `$VAULT_WRAPPED_SECRET`; both set together selects `certkey.Prompter`,
+  neither set falls back to `terminal.Prompter`, and exactly one set is
+  treated as a misconfiguration and exits immediately (`os.Exit(2)`) rather
+  than silently falling back to a terminal prompt that would just hang or
+  error with no TTY attached.
+- **`cert-gen` produces the RSA cert/key pair `cert-wrap` needs, and is
+  deliberately just a thin CLI wrapper over `certkey.GenerateSelfSigned`.**
+  It's a `noVaultCmd` (alongside `vaults`/`assets`) since it doesn't touch
+  any vault, and — unlike `inject -dir`/`extract -dir`, which require their
+  folder argument to already exist — it creates `outDir` via `os.MkdirAll`,
+  since the point is producing a new location, not operating on an
+  existing one. The certificate's validity period is set generously (10
+  years, `selfSignedValidity`) purely for tooling hygiene: boxcar never
+  actually checks expiry or does any trust-chain validation on it (see
+  `parseCertPublicKey`, which only ever extracts the public key), so an
+  "expired" cert would still wrap/unwrap correctly regardless.
+- **Protecting the private key itself is not a separate feature — it's the
+  existing folder-vault mechanism, reused.** `cert-gen`'s output
+  (`cert.pem`, `key.pem`) is just two files, so bundling them into their
+  own password-protected vault is exactly `inject -dir`/`extract -dir`
+  against a vault named for the purpose (e.g. `keyvault`) — no new code
+  needed for that half of the story. See `README.md`'s "Full walkthrough"
+  and `TestRun_FullNonInteractiveWorkflow`, which exercises the entire
+  chain — `cert-gen` → bundle into `keyvault` → populate a data vault →
+  `cert-wrap` it → simulate a one-time server-side `extract -dir` recovery
+  → fully non-interactive `extract` with zero secrets queued.
+
 ## Command dispatch
 
 `cli.App.Run` is a thin switch over `args[0]` after `parseVaultFlag` strips
@@ -284,11 +358,23 @@ accepted limitations, each with what (if anything) mitigates it today.
 
 ## Considered future enhancements
 
-Not implemented, not currently planned — recorded here so the reasoning
-isn't re-derived from scratch if this comes up again. Prompted by: "are
-there any secure passwordless options" for unlocking a vault, instead of a
-typed secret.
+Recorded here so the reasoning isn't re-derived from scratch if this comes
+up again. Prompted by: "are there any secure passwordless options" for
+unlocking a vault, instead of a typed secret — and, in a later session,
+specifically "what other options instead of password" for *non-interactive*
+use, which led to implementing the certificate-wrapped option below.
 
+- **Certificate-wrapped secret — implemented**, see "Non-interactive secret
+  supply (certificate-wrapped)" above (`internal/certkey`, `cert-wrap`).
+  This is the "random keyfile" idea below, generalized: rather than a raw
+  keyfile *being* the secret (something you have, full stop), the private
+  key only *unwraps* a secret that was deliberately encrypted to it — so
+  losing or copying the wrapped-secret file alone (without the private key)
+  doesn't expose anything, unlike a bare keyfile. It doesn't remove the
+  human from the picture entirely: `cert-wrap` still needs a human to
+  provide the vault's existing secret once, interactively — what it
+  removes is the *ongoing* need for a human on every subsequent
+  `extract`/`inject`/`rotate` in CI/cron/deploy contexts.
 - **OS keychain integration** (macOS Keychain / Windows Credential Manager
   / Linux Secret Service, e.g. via `github.com/zalando/go-keyring`). Boxcar
   would store the vault secret there instead of prompting for it; unlocking
@@ -313,12 +399,13 @@ typed secret.
   copy carelessly (defeating the point) without more supporting tooling
   than boxcar currently has (no keyfile generation/backup guidance exists).
 
-None of these are drop-in: each would need a `Prompter`-equivalent
-abstraction for a non-terminal secret source (the current `cli.Prompter`
-interface already models "get a secret" abstractly, so it's a plausible
-seam to extend rather than replace), and a decision on how it interacts
-with the existing scrypt/AES-GCM per-entry design — none of these options
-replace that; they only replace *how the secret is obtained*, not how it
+None of the still-unimplemented options above are drop-in: each would need
+a `Prompter`-equivalent abstraction for a non-terminal secret source — which
+is exactly the seam `certkey.Prompter` demonstrates, since `cli.Prompter`
+already models "get a secret" abstractly enough to extend rather than
+replace — and a decision on how it interacts with the existing scrypt/
+AES-GCM per-entry design. None of these options, implemented or not, touch
+that design; they only replace *how the secret is obtained*, not how it
 protects an entry once obtained.
 
 ## Non-goals

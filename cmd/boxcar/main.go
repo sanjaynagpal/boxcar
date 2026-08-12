@@ -20,15 +20,23 @@
 //	boxcar [-vault NAME] inject <name> <srcFile>...  # append file(s)
 //	boxcar [-vault NAME] extract <name> <dest>       # prompts for the secret
 //	boxcar [-vault NAME] list                        # list injected entries
+//	boxcar [-vault NAME] cert-wrap <certPEM> <out>   # wrap the secret for non-interactive use
 //	boxcar vaults                                    # list all vaults on disk
 //
 // -vault defaults to VAULT_NAME, then "dev". Each vault is stored in
 // vault.<NAME>.json.
+//
+// Normally the secret is read from a real terminal. If VAULT_KEY_FILE (a
+// PEM RSA private key) and VAULT_WRAPPED_SECRET (from cert-wrap) are both
+// set, the secret is unwrapped from those instead — no human needed. See
+// package certkey.
 package main
 
 import (
+	"fmt"
 	"os"
 
+	"github.com/sanjaynagpal/boxcar/internal/certkey"
 	"github.com/sanjaynagpal/boxcar/internal/cli"
 	"github.com/sanjaynagpal/boxcar/internal/terminal"
 	"github.com/sanjaynagpal/boxcar/internal/vault"
@@ -36,13 +44,34 @@ import (
 
 func main() {
 	app := &cli.App{
-		Store: vault.Store{},
-		Prompter: terminal.Prompter{
-			Out: os.Stderr,
-			FD:  int(os.Stdin.Fd()),
-		},
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		Store:    vault.Store{},
+		Prompter: buildPrompter(),
+		Stdout:   os.Stdout,
+		Stderr:   os.Stderr,
 	}
 	os.Exit(app.Run(os.Args[1:]))
+}
+
+// buildPrompter picks how the secret is obtained. Ordinarily that's a real
+// terminal prompt (terminal.Prompter), which requires a human at a TTY. If
+// both $VAULT_KEY_FILE (a PEM RSA private key) and $VAULT_WRAPPED_SECRET
+// (produced by `boxcar cert-wrap`) are set, boxcar unlocks the vault from
+// those instead — no human needed, for CI/cron/deploy scripts. Setting only
+// one of the two is treated as a misconfiguration and fails fast rather
+// than silently falling back to a terminal prompt that would just hang or
+// error in a non-interactive shell.
+func buildPrompter() cli.Prompter {
+	keyFile := os.Getenv("VAULT_KEY_FILE")
+	wrappedFile := os.Getenv("VAULT_WRAPPED_SECRET")
+	switch {
+	case keyFile != "" && wrappedFile != "":
+		return certkey.Prompter{WrappedFile: wrappedFile, KeyFile: keyFile}
+	case keyFile != "" || wrappedFile != "":
+		fmt.Fprintln(os.Stderr, "error: VAULT_KEY_FILE and VAULT_WRAPPED_SECRET must both be set together")
+		os.Exit(2)
+	}
+	return terminal.Prompter{
+		Out: os.Stderr,
+		FD:  int(os.Stdin.Fd()),
+	}
 }

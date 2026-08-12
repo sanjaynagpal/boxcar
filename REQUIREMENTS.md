@@ -100,7 +100,53 @@ deliberate design requirement, not a limitation to work around.
   never left with entries under a mix of old and new secrets.
 - Rotating an empty vault is rejected (nothing to rotate).
 
-### 5. Multiple named vaults
+### 5. Non-interactive secret supply (no human present)
+- By default the secret is read from a real terminal (`internal/terminal.Prompter`),
+  which requires a human at a TTY and cannot work in CI/cron/deploy scripts.
+- `cert-wrap <certPEM> <outFile>` envelope-encrypts a vault's *current*
+  secret to an RSA certificate's public key and writes the result to
+  `outFile`: a fresh random AES-256 data key is generated, the secret is
+  sealed under it with AES-256-GCM, and only that small, fixed-size data key
+  is wrapped with RSA-OAEP(SHA-256) — so the wrapped secret's length is never
+  limited by the certificate's RSA key size. `cert-wrap` requires the vault
+  to already have at least one entry (its secret must already exist) and
+  verifies the supplied secret against the vault before wrapping, the same
+  as `rotate`'s current-secret check. Only RSA certificates/keys are
+  currently supported.
+- At runtime, setting both `$VAULT_KEY_FILE` (a PEM-encoded RSA private key)
+  and `$VAULT_WRAPPED_SECRET` (an `outFile` from `cert-wrap`) makes boxcar
+  recover the secret from those instead of prompting a human — no other
+  behavior changes; every command works identically either way, since both
+  paths just produce a secret byte slice. Setting only one of the two is a
+  misconfiguration and fails fast rather than silently falling back to an
+  interactive prompt that would hang or error with no TTY attached.
+- The wrapped-secret file is treated as sensitive (`0600`) but is not a
+  secret on its own: recovering the vault secret from it requires the
+  matching RSA private key, which this design assumes is protected
+  separately (a CI secret store, a mounted file with restricted
+  permissions, etc.) — boxcar does not manage private key storage itself.
+- `cert-gen <outDir>` generates a fresh self-signed RSA certificate/key pair
+  for use with `cert-wrap`, writing `outDir/cert.pem` and `outDir/key.pem`.
+  It creates `outDir` if it doesn't already exist (unlike `inject -dir`/
+  `extract -dir`, which require their folder argument to pre-exist — the
+  point here is to create something new). The certificate is never
+  validated for trust or expiry anywhere in boxcar (only its public key is
+  ever read out of it), so it is not a substitute for a real CA-issued
+  certificate in contexts that need one — it exists solely as an RSA
+  keypair carrier for `cert-wrap`/`cert-gen`'s envelope encryption.
+- **Protecting the private key itself in transit/at rest** is left to
+  existing vault mechanics, not a separate feature: since `key.pem` is just
+  a file, it can be bundled — along with `cert.pem` — into its own
+  password-protected vault with the ordinary `inject -dir`/`extract -dir`
+  commands (e.g. `inject -dir` into a vault named `keyvault`). That vault
+  can then be deployed like any other; recovering the key on the target
+  host is a one-time `extract -dir` (still requires the keyvault's own
+  password, so it's still a human-in-the-loop step, but only once per
+  host/rotation) after which `$VAULT_KEY_FILE`/`$VAULT_WRAPPED_SECRET`
+  make every subsequent command against the *data* vault non-interactive.
+  See `README.md`'s "Full walkthrough" for the worked example.
+
+### 6. Multiple named vaults
 - Any vault name matching `[A-Za-z0-9_-]` (max 64 chars) is allowed — e.g.
   `dev`, `test`, `prod`, `team-a`, `ci`, `staging`.
 - The vault is selected with `-vault NAME`, falling back to `$VAULT_NAME`.
@@ -108,7 +154,8 @@ deliberate design requirement, not a limitation to work around.
   `vault.*.json` exists in the store's directory, that vault is used
   automatically; otherwise (no vaults yet, or more than one — genuinely
   ambiguous) the long-standing default of `dev` is used. This lookup never
-  runs for `vaults`/`assets`, which aren't scoped to a specific vault.
+  runs for `vaults`/`assets`/`cert-gen`, none of which are scoped to a
+  specific vault.
 - Each vault is an isolated sidecar file `vault.<NAME>.json`. Entries and
   secrets do not cross vaults.
 - The `vaults` command lists every `vault.*.json` on disk with entry counts.
@@ -144,12 +191,16 @@ boxcar [-vault NAME] extract <name> <destPath>
 boxcar [-vault NAME] extract -dir <destFolder>
 boxcar [-vault NAME] extract -parent <name> <destFolder>
 boxcar [-vault NAME] rotate
+boxcar [-vault NAME] cert-wrap <certPEM> <outFile>
 boxcar [-vault NAME] list
 boxcar vaults
 boxcar assets
+boxcar cert-gen <outDir>
 ```
 
 `-vault` defaults to `$VAULT_NAME`, then `dev`. Each vault → `vault.<NAME>.json`.
+`$VAULT_KEY_FILE` + `$VAULT_WRAPPED_SECRET` (set together) unlock a vault
+non-interactively instead of prompting a human — see §5.
 
 ## Out of scope / notes
 - There is no persistent audit log or multi-user access control — a vault's

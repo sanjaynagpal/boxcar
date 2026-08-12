@@ -8,8 +8,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sanjaynagpal/boxcar/internal/certkey"
 	"github.com/sanjaynagpal/boxcar/internal/vault"
 )
+
+// genRSACert returns a self-signed RSA cert/key pair PEM-encoded, for
+// exercising cert-wrap without checking in static key material. It's a
+// thin wrapper over certkey.GenerateSelfSigned (the same function cert-gen
+// itself calls) so tests exercise real production cert-generation logic
+// instead of duplicating it.
+func genRSACert(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+	certPEM, keyPEM, err := certkey.GenerateSelfSigned("test")
+	if err != nil {
+		t.Fatalf("GenerateSelfSigned: %v", err)
+	}
+	return certPEM, keyPEM
+}
 
 // fakePrompter returns secrets from a fixed queue, ignoring the prompt text.
 type fakePrompter struct {
@@ -362,6 +377,248 @@ func TestRun_RotateEmptyVault(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "nothing to rotate") {
 		t.Errorf("stderr = %q, want mention of nothing to rotate", stderr.String())
+	}
+}
+
+func TestRun_CertGenCreatesUsableCertAndKey(t *testing.T) {
+	app, stdout, stderr := newTestApp(t)
+
+	// outDir deliberately does not exist yet — cert-gen must create it,
+	// unlike inject -dir/extract -dir which require the folder to pre-exist.
+	outDir := filepath.Join(t.TempDir(), "certs")
+	if code := app.Run([]string{"cert-gen", outDir}); code != 0 {
+		t.Fatalf("cert-gen: code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), outDir) {
+		t.Errorf("stdout = %q, want it to mention %q", stdout.String(), outDir)
+	}
+
+	certPEM, err := os.ReadFile(filepath.Join(outDir, "cert.pem"))
+	if err != nil {
+		t.Fatalf("read cert.pem: %v", err)
+	}
+	keyPEM, err := os.ReadFile(filepath.Join(outDir, "key.pem"))
+	if err != nil {
+		t.Fatalf("read key.pem: %v", err)
+	}
+
+	// The generated pair must actually work for wrap/unwrap.
+	w, err := certkey.WrapSecret([]byte("hunter2-plenty-long"), certPEM)
+	if err != nil {
+		t.Fatalf("WrapSecret: %v", err)
+	}
+	got, err := certkey.UnwrapSecret(w, keyPEM)
+	if err != nil {
+		t.Fatalf("UnwrapSecret: %v", err)
+	}
+	if string(got) != "hunter2-plenty-long" {
+		t.Fatalf("got %q, want %q", got, "hunter2-plenty-long")
+	}
+}
+
+func TestRun_CertGenDoesNotRequireVaultFlag(t *testing.T) {
+	// cert-gen touches no vault at all, so it must work identically to
+	// "vaults"/"assets" with no -vault flag and no vault.*.json on disk.
+	app, _, stderr := newTestApp(t)
+	outDir := filepath.Join(t.TempDir(), "certs")
+	if code := app.Run([]string{"cert-gen", outDir}); code != 0 {
+		t.Fatalf("cert-gen: code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRun_CertWrapThenNonInteractiveExtract(t *testing.T) {
+	certPEM, keyPEM := genRSACert(t)
+
+	app, stdout, stderr := newTestApp(t,
+		"correct-secret", // inject: sets the vault secret
+		"correct-secret", // cert-wrap: current secret
+	)
+
+	src := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(src, []byte("hello world"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if code := app.Run([]string{"-vault", "dev", "inject", "note", src}); code != 0 {
+		t.Fatalf("inject: code=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	wrappedPath := filepath.Join(dir, "wrapped.json")
+	if code := app.Run([]string{"-vault", "dev", "cert-wrap", certPath, wrappedPath}); code != 0 {
+		t.Fatalf("cert-wrap: code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "wrapped") {
+		t.Errorf("stdout after cert-wrap = %q", stdout.String())
+	}
+	if _, err := os.Stat(wrappedPath); err != nil {
+		t.Fatalf("wrapped secret file missing: %v", err)
+	}
+
+	// Simulate the non-interactive side: a second App, using the same
+	// vault.Store.Dir but a certkey.Prompter instead of a human — no
+	// secrets queued at all, proving no human interaction happens.
+	keyPath := filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	var nonInteractiveStdout, nonInteractiveStderr bytes.Buffer
+	nonInteractiveApp := &App{
+		Store:    app.Store,
+		Prompter: certkey.Prompter{WrappedFile: wrappedPath, KeyFile: keyPath},
+		Stdout:   &nonInteractiveStdout,
+		Stderr:   &nonInteractiveStderr,
+	}
+	dest := filepath.Join(t.TempDir(), "out.txt")
+	if code := nonInteractiveApp.Run([]string{"-vault", "dev", "extract", "note", dest}); code != 0 {
+		t.Fatalf("non-interactive extract: code=%d stderr=%s", code, nonInteractiveStderr.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != "hello world" {
+		t.Fatalf("extracted content = %q, %v", got, err)
+	}
+}
+
+func TestRun_CertWrapEmptyVaultRejected(t *testing.T) {
+	certPEM, _ := genRSACert(t)
+	app, _, stderr := newTestApp(t)
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	wrappedPath := filepath.Join(dir, "wrapped.json")
+	if code := app.Run([]string{"-vault", "dev", "cert-wrap", certPath, wrappedPath}); code == 0 {
+		t.Fatal("cert-wrap on an empty vault unexpectedly succeeded")
+	}
+	if !strings.Contains(stderr.String(), "empty") {
+		t.Errorf("stderr = %q, want mention of the empty vault", stderr.String())
+	}
+}
+
+func TestRun_CertWrapWrongSecretRejected(t *testing.T) {
+	certPEM, _ := genRSACert(t)
+	app, _, stderr := newTestApp(t, "correct-secret", "wrong-secret!")
+
+	src := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(src, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if code := app.Run([]string{"-vault", "dev", "inject", "note", src}); code != 0 {
+		t.Fatalf("inject: code=%d", code)
+	}
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	wrappedPath := filepath.Join(dir, "wrapped.json")
+	if code := app.Run([]string{"-vault", "dev", "cert-wrap", certPath, wrappedPath}); code == 0 {
+		t.Fatal("cert-wrap with the wrong current secret unexpectedly succeeded")
+	}
+	if !strings.Contains(stderr.String(), "secret does not match") {
+		t.Errorf("stderr = %q, want mention of a non-matching secret", stderr.String())
+	}
+	if _, err := os.Stat(wrappedPath); err == nil {
+		t.Fatal("wrapped secret file was written despite the wrong secret")
+	}
+}
+
+// TestRun_FullNonInteractiveWorkflow walks the complete story end to end:
+// generate a self-signed cert/key pair, bundle the pair itself into its own
+// password-protected "key vault" (so the private key is never a bare
+// plaintext file at rest or in transit), populate a separate "data" vault
+// with a real secret, wrap the data vault's secret to the certificate, then
+// simulate arriving on a server: a one-time interactive step recovers the
+// key vault's contents to disk, after which the data vault is extracted
+// with zero secrets typed — proving the automation path needs a human only
+// once, for provisioning, never for the actual application run.
+func TestRun_FullNonInteractiveWorkflow(t *testing.T) {
+	app, stdout, stderr := newTestApp(t,
+		"keyvault-secret-long-enough", // inject -dir into "keyvault": sets its secret
+		"prod-secret-long-enough",     // inject into "prod": sets its secret
+		"prod-secret-long-enough",     // cert-wrap "prod": verifies current secret
+		"keyvault-secret-long-enough", // extract -dir "keyvault" on the "server": one-time recovery
+	)
+	root := t.TempDir()
+
+	// 1. Generate a self-signed RSA cert/key pair. No vault, no secret.
+	certsDir := filepath.Join(root, "certs")
+	if code := app.Run([]string{"cert-gen", certsDir}); code != 0 {
+		t.Fatalf("cert-gen: code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cert.pem") {
+		t.Errorf("stdout after cert-gen = %q", stdout.String())
+	}
+	stdout.Reset()
+
+	// 2. Bundle the cert+key pair itself into its own vault, protected by a
+	// password — this is what actually gets "deployed to the server": a
+	// single encrypted file, not bare key material.
+	if code := app.Run([]string{"-vault", "keyvault", "inject", "-dir", certsDir}); code != 0 {
+		t.Fatalf("inject keyvault: code=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+
+	// 3. Populate the real "prod" data vault with an application secret.
+	dbSecretSrc := filepath.Join(root, "db-password.txt")
+	if err := os.WriteFile(dbSecretSrc, []byte("hunter2"), 0o600); err != nil {
+		t.Fatalf("write db secret source: %v", err)
+	}
+	if code := app.Run([]string{"-vault", "prod", "inject", "db-password", dbSecretSrc}); code != 0 {
+		t.Fatalf("inject prod: code=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+
+	// 4. Wrap prod's secret to the certificate's public key — this is the
+	// step that would be run once, wherever prod's secret is known, and the
+	// resulting file shipped alongside vault.prod.json.
+	wrappedPath := filepath.Join(root, "prod.wrapped.json")
+	if code := app.Run([]string{"-vault", "prod", "cert-wrap", filepath.Join(certsDir, "cert.pem"), wrappedPath}); code != 0 {
+		t.Fatalf("cert-wrap: code=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+
+	// 5. Simulate arriving on the server: everything above (vault.keyvault.json,
+	// vault.prod.json, prod.wrapped.json — all just files under app.Store.Dir)
+	// is now "deployed". A one-time interactive step recovers the private
+	// key from the key vault onto local disk.
+	recoveredDir := filepath.Join(root, "recovered")
+	if err := os.MkdirAll(recoveredDir, 0o755); err != nil {
+		t.Fatalf("mkdir recoveredDir: %v", err)
+	}
+	if code := app.Run([]string{"-vault", "keyvault", "extract", "-dir", recoveredDir}); code != 0 {
+		t.Fatalf("extract keyvault: code=%d stderr=%s", code, stderr.String())
+	}
+	// injectDir prefixed entry names with certsDir's own base name, so
+	// extract -dir recreates that same layout under recoveredDir.
+	recoveredKeyPath := filepath.Join(recoveredDir, filepath.Base(certsDir), "key.pem")
+	if _, err := os.Stat(recoveredKeyPath); err != nil {
+		t.Fatalf("recovered private key missing: %v", err)
+	}
+
+	// 6. The actual non-interactive run: a fresh App wired with
+	// certkey.Prompter instead of a human, and NO secrets queued at all.
+	var nonInteractiveStdout, nonInteractiveStderr bytes.Buffer
+	nonInteractiveApp := &App{
+		Store:    app.Store,
+		Prompter: certkey.Prompter{WrappedFile: wrappedPath, KeyFile: recoveredKeyPath},
+		Stdout:   &nonInteractiveStdout,
+		Stderr:   &nonInteractiveStderr,
+	}
+	dest := filepath.Join(root, "restored-db-password.txt")
+	if code := nonInteractiveApp.Run([]string{"-vault", "prod", "extract", "db-password", dest}); code != 0 {
+		t.Fatalf("non-interactive extract: code=%d stderr=%s", code, nonInteractiveStderr.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != "hunter2" {
+		t.Fatalf("restored secret = %q, %v, want %q", got, err, "hunter2")
 	}
 }
 
