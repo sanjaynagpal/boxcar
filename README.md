@@ -47,7 +47,9 @@ Or, against this module directly:
 go install github.com/sanjaynagpal/boxcar/cmd/boxcar@latest
 ```
 
-Requires Go 1.22+.
+Requires Go 1.26+ (or any Go with `GOTOOLCHAIN=auto`, the default since Go
+1.21, which transparently downloads 1.26 for this module if your installed
+`go` is older).
 
 ## Quick start
 
