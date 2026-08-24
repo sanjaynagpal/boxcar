@@ -1,0 +1,23 @@
+---
+boxcar_bin_src: "{{ playbook_dir }}/../../boxcar"
+boxcar_bin_dest: /usr/local/bin/boxcar
+
+boxcar_user: boxcar
+boxcar_group: boxcar
+boxcar_home: /etc/boxcar
+
+boxcar_vault_name: prod
+
+boxcar_local_dir: "{{ playbook_dir }}/../.."
+boxcar_local_vault_file: "{{ boxcar_local_dir }}/vault.{{ boxcar_vault_name }}.json"
+boxcar_local_wrapped_file: "{{ boxcar_local_dir }}/{{ boxcar_vault_name }}.wrapped.json"
+
+boxcar_systemd_service: myapp.service
+boxcar_manage_service: true
+
+# boxcar_recovered_key_pem has NO default here, deliberately. It's the raw
+# RSA private key content and must come from an ansible-vault-encrypted
+# source (see ops/scripts/prepare-ansible-secret.sh and ops/README.md) —
+# giving it a default, even an empty one, would let a missing or
+# misconfigured vault file fail silently instead of via the explicit
+# assert in tasks/main.yml.

@@ -1,0 +1,6 @@
+---
+- name: restart boxcar-consumer service
+  ansible.builtin.systemd:
+    name: "{{ boxcar_systemd_service }}"
+    state: restarted
+  when: boxcar_manage_service | bool

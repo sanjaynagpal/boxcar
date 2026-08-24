@@ -241,6 +241,198 @@ vault's secret, even by accident. Use this:
 
 ---
 
+## Unattended / automated deployments (CI, cron, systemd)
+
+Every procedure above assumes a human is at a terminal to type the vault's
+secret. For a pipeline, a cron job, or a service that must `extract` a
+secret with nobody watching, boxcar recovers the secret from a pre-wrapped
+file plus a locally-held RSA private key instead (`internal/certkey`) —
+see `README.md`'s "Full walkthrough" for the canonical worked example this
+section summarizes operationally.
+
+`ops/scripts/` and `ops/ansible/` (see `ops/README.md`) automate
+procedures #11-15 below for a persistent-host/systemd fleet — the
+commands here are still worth reading first, since the tooling is a thin
+wrapper around exactly these steps, not a different workflow.
+
+Three files are involved, and they are not equally sensitive:
+
+| File | What it is | On its own |
+|---|---|---|
+| `vault.<NAME>.json` (e.g. `vault.prod.json`) | The actual encrypted secrets | Useless without `<NAME>`'s secret |
+| `<name>.wrapped.json` (any name — it's `cert-wrap`'s output-path arg, not a fixed name) | `<NAME>`'s secret, RSA-encrypted to a public key | Useless without the matching private key |
+| `key.pem` (from `cert-gen`, normally kept inside its own `keyvault`) | The RSA private key that unwraps the file above | **The real secret, once it's on disk in plaintext — see procedure #14** |
+
+### 11. One-time provisioning: enable password-free extraction
+
+```
+# On your workstation:
+boxcar cert-gen ./certs                                    # -> ./certs/cert.pem, ./certs/key.pem
+boxcar -vault keyvault inject -dir ./certs                  # prompts for a NEW keyvault password, twice
+boxcar -vault prod inject db-password ./db-password.txt     # prompts for prod's password
+boxcar -vault prod cert-wrap ./certs/cert.pem ./prod.wrapped.json   # prompts for prod's password AGAIN
+```
+
+- `cert-wrap` is not a bystander step — it re-verifies `prod`'s secret
+  itself before wrapping it, so expect a **third** password prompt here
+  even though `prod` was already unlocked once during `inject`.
+- Copy `vault.keyvault.json`, `vault.prod.json`, and `prod.wrapped.json` to
+  the target host. None of the three is plaintext on its own.
+- **RSA only.** `cert-wrap`/extraction reject any certificate or key that
+  isn't RSA (`certificate's public key is *ecdsa.PublicKey, only RSA is
+  currently supported`, or similar for the private key) — there's no
+  silent fallback for EC material.
+
+### 12. One-time recovery on the target host
+
+```
+mkdir ./recovered
+boxcar -vault keyvault extract -dir ./recovered      # the one human-typed password on this host
+```
+
+- **The recovered key does not land flat.** `inject -dir ./certs` names
+  each entry `certs/<file>`, and `extract -dir` reproduces that same
+  layout — the key ends up at `./recovered/certs/key.pem`, not
+  `./recovered/key.pem`. A script that assumes the flat path will fail
+  with "no such file," which has nothing to do with the crypto.
+- This step needs a real human at a real terminal (same `terminal.Prompter`
+  as every other interactive command) — it is **not** something you can
+  run unattended. See procedure #13 for hosts where that's not possible.
+
+### 13. Every subsequent run: fully unattended
+
+```
+export VAULT_KEY_FILE=./recovered/certs/key.pem
+export VAULT_WRAPPED_SECRET=./prod.wrapped.json
+boxcar -vault prod extract db-password ./restored.txt    # no prompt at all
+```
+
+- Both variables must be set together, or boxcar exits immediately:
+  `error: VAULT_KEY_FILE and VAULT_WRAPPED_SECRET must both be set
+  together` (exit code 2) — deliberate fail-fast so a half-configured job
+  errors loudly instead of hanging on a prompt with no TTY to write to.
+- A wrong/mismatched key and a tampered wrapped file fail identically:
+  `incorrect private key or corrupted wrapped secret`. There's no way to
+  tell those apart from the error text alone.
+
+### 14. Ephemeral CI runners — procedure #12 doesn't run there
+
+Procedure #12 assumes a persistent host: a human types the keyvault
+password once, and the recovered key stays on that disk for every future
+run. A GitHub Actions **hosted** runner is a fresh VM every job — there's
+no "once" to have, and no human present mid-job to type anything.
+
+For that case, do the recovery in procedure #12 **on your own machine**,
+then hand the *already-recovered* `key.pem` to the CI platform's own
+secret store (e.g. a repository/environment secret) — never the keyvault
+password itself, and never `vault.keyvault.json`. At job start, materialize
+that secret to a temp file and point `VAULT_KEY_FILE` at it:
+
+```
+- run: echo "$RECOVERED_KEY_PEM" > "$RUNNER_TEMP/key.pem" && chmod 600 "$RUNNER_TEMP/key.pem"
+  env:
+    RECOVERED_KEY_PEM: ${{ secrets.PROD_RSA_KEY }}
+- run: boxcar -vault prod extract db-password ./restored.txt
+  env:
+    VAULT_KEY_FILE: ${{ runner.temp }}/key.pem
+    VAULT_WRAPPED_SECRET: ${{ github.workspace }}/prod.wrapped.json
+```
+
+A self-hosted runner or a persistent host (systemd service, a long-lived
+cron box) is what procedure #12 actually describes: recover once, leave
+`key.pem` on that host's disk, reuse it until the next rotation.
+
+**The recovered private key is the new root of trust on that host.** Once
+procedure #12 has run, `key.pem` sits in plaintext at `0600` — the
+keyvault password that protected it no longer applies to anything.
+`internal/certkey` deliberately does not manage where that key lives
+long-term (see `DESIGN.md`'s threat model): anyone who can read that file
+on that host can recover `prod`'s secret using `prod.wrapped.json` alone.
+Protect it like any other bare secret at rest — restrict it to the service
+account that actually runs boxcar, keep it off shared/NFS mounts and out
+of backups that aren't equally access-controlled, and prefer a CI-native
+secret store, a mounted restricted-permission file, or an HSM over a
+hand-copied file when you have the choice.
+
+### 15. Rotating `prod`'s secret breaks `prod.wrapped.json` — re-wrap every time
+
+`boxcar -vault prod rotate` (procedure #6) re-seals every entry under a
+**new** secret. `prod.wrapped.json` still only unwraps the **old** one —
+`rotate` has no way to know a wrapped file exists and cannot update it.
+
+After every `rotate` on a vault that has any wrapped file in circulation:
+
+```
+boxcar -vault prod cert-wrap ./certs/cert.pem ./prod.wrapped.json   # overwrite with the NEW secret, wrapped
+```
+
+then redistribute the new `prod.wrapped.json` to every host/pipeline that
+uses it. Until you do, unattended `extract` on that vault fails with
+`incorrect private key or corrupted wrapped secret` — indistinguishable
+from a genuinely corrupted file. **If unattended extraction starts failing
+right after a rotation, check whether `prod.wrapped.json` was re-wrapped
+and redistributed** before assuming the key was lost or corrupted.
+
+The RSA keypair itself doesn't need to change on rotation — only the
+wrapped file. Re-run `cert-gen`/re-provision `keyvault` only if you
+suspect the *private key* (not the vault secret) was compromised.
+
+### 16. If a keyvault or data-vault password is forgotten
+
+This workflow (procedures #11-15) runs on **two independent human-chosen
+passwords per environment** — the keyvault's and the data vault's (see
+`ops/README.md`'s "Multiple environments" table). Boxcar has no backdoor
+for either, by design (see "I lost the secret" below) — but *which*
+password is gone, and *when* in the lifecycle it's forgotten, changes the
+blast radius considerably. It is not always total loss.
+
+**Data-vault password (`prod`, etc.) forgotten:**
+
+- **If `cert-wrap` already ran and `prod.wrapped.json` is distributed:**
+  unattended `extract` keeps working *forever* — it only ever goes
+  through the RSA envelope (`VAULT_KEY_FILE`/`VAULT_WRAPPED_SECRET`),
+  never the human password. What's permanently lost is the ability to
+  *write*: `inject` (new entries) and `rotate` both require verifying the
+  current secret interactively, and there is no way to do that without
+  it. The vault is frozen — readable by every host that already has the
+  wrapped file, but it can never gain a new entry or be rotated again.
+- **If `cert-wrap` never ran, or the vault predates it:** total loss,
+  same as the generic case below — nothing in that vault is recoverable
+  by anyone, from any host, ever.
+
+**Keyvault password forgotten:**
+
+- **If procedure #12 (or `prepare-ansible-secret.sh`) already ran on
+  every host/control node that needs the RSA key:** mostly harmless day
+  to day. The recovered `key.pem` already exists independently of the
+  keyvault password (in `ansible-vault`, or wherever it was placed) —
+  ongoing unattended `extract` never touches `vault.keyvault.json` again.
+  That file becomes a permanently unreadable, orphaned artifact, but
+  nothing currently running needs it.
+- **If a *new* host or environment needs onboarding later** (i.e.
+  procedure #12 has to run again to recover the RSA key onto a machine
+  that doesn't have it yet): total loss of that keypair. Every
+  `<env>.wrapped.json` ever made with it — across *every* environment
+  that shares the keypair — becomes permanently inert. This is exactly
+  why "Multiple environments" says to use a **separate** RSA keypair per
+  environment: it caps this particular disaster to one environment
+  instead of all of them. Recovery is full re-provisioning: new
+  `cert-gen`, new keyvault, re-inject the data vault's contents under a
+  fresh `cert-wrap`, redistribute to every host again.
+
+**The mitigation is entirely procedural, not a boxcar feature.** Both
+passwords need to survive independently of any one operator's memory —
+a password manager or an organizational secrets vendor, chosen and
+recorded the moment each password is set (during procedure #11's two
+`inject`/confirm prompts), plus a documented handoff process for
+personnel changes. Nothing in `ops/` automates writing a freshly-chosen
+password anywhere on your behalf — that's a deliberate choice, not a gap:
+routing a password through any additional store on the way out of a
+human's head is one more place it can leak, so this stays a plain
+two-password operational discipline rather than new tooling.
+
+---
+
 ## Troubleshooting reference
 
 | You see | What it means | What to do |
@@ -254,6 +446,10 @@ vault's secret, even by accident. Use this:
 | `vault "NAME" is empty; nothing to rotate` | You ran `rotate` on a vault with zero entries | Nothing to do — there's no secret to rotate yet |
 | `read source "...": ...` | `inject`'s source file couldn't be read | Check the path/permissions of the file you're injecting |
 | `warning: ... is readable by group/other (mode ...)` | Vault file permissions were loosened after the fact | `chmod 600` it (see procedure #8); this is advisory, the command still ran |
+| `error: VAULT_KEY_FILE and VAULT_WRAPPED_SECRET must both be set together` | Only one of the two non-interactive env vars is set | Set both, or neither; exit code 2 |
+| `incorrect private key or corrupted wrapped secret` | `certkey.Prompter` couldn't unwrap: wrong private key, tampered wrapped file, or the vault was rotated since the wrapped file was made | Confirm `VAULT_KEY_FILE` matches the cert used in `cert-wrap`; if the vault was rotated since, re-run `cert-wrap` and redistribute (procedure #15) |
+| `certificate's public key is *ecdsa.PublicKey, only RSA is currently supported` (or similar) | `cert-wrap`/extraction was pointed at a non-RSA certificate or key | Regenerate with `boxcar cert-gen`, or supply RSA material |
+| `vault "NAME" is empty; inject at least one entry before wrapping its secret` | `cert-wrap` run before any `inject` into that vault | Inject at least one entry first |
 | `(NAME vault empty)` / `(no vaults yet ...)` | No error — this vault (or directory) genuinely has nothing in it yet | Confirm you're in the expected working directory |
 | Exit code 2 | Usage/argument error (bad flags, wrong arg count, invalid vault name) | Check the command syntax against the quick reference |
 | Exit code 1 | Command was well-formed but failed (bad secret, missing file, I/O error) | See the specific error message on stderr |

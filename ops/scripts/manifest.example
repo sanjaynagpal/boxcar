@@ -1,0 +1,15 @@
+# Manifest for provision-workstation.sh — one secret per line, as
+# entry-name:source-file. Blank lines and #-comments are ignored.
+#
+# Copy this file, edit the entries, and pass it as the first argument:
+#   provision-workstation.sh manifest.txt
+#
+# Each line becomes one `boxcar -vault <VAULT_NAME> inject <name> <src>`
+# call. Paths are relative to wherever you run the script from, not to
+# this manifest file. The split is on the first ":" only, so avoid
+# Windows-style drive-letter paths here (C:\...) — use forward slashes.
+
+db-password:./secrets/db-password.txt
+api-key:./secrets/api-key.txt
+stripe-webhook-secret:./secrets/stripe-webhook-secret.txt
+tls-client-key:./secrets/certs/client-key.pem

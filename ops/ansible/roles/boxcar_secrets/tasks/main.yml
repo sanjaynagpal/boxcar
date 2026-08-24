@@ -1,0 +1,91 @@
+---
+- name: Ensure boxcar system group exists
+  ansible.builtin.group:
+    name: "{{ boxcar_group }}"
+    system: true
+    state: present
+
+- name: Ensure boxcar system user exists
+  ansible.builtin.user:
+    name: "{{ boxcar_user }}"
+    group: "{{ boxcar_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    state: present
+
+- name: Ensure boxcar home directory exists
+  ansible.builtin.file:
+    path: "{{ boxcar_home }}"
+    state: directory
+    owner: "{{ boxcar_user }}"
+    group: "{{ boxcar_group }}"
+    mode: "0750"
+
+- name: Install boxcar binary
+  ansible.builtin.copy:
+    src: "{{ boxcar_bin_src }}"
+    dest: "{{ boxcar_bin_dest }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Copy data vault (application secrets)
+  ansible.builtin.copy:
+    src: "{{ boxcar_local_vault_file }}"
+    dest: "{{ boxcar_home }}/vault.{{ boxcar_vault_name }}.json"
+    owner: "{{ boxcar_user }}"
+    group: "{{ boxcar_group }}"
+    mode: "0600"
+
+- name: Copy wrapped secret
+  ansible.builtin.copy:
+    src: "{{ boxcar_local_wrapped_file }}"
+    dest: "{{ boxcar_home }}/{{ boxcar_vault_name }}.wrapped.json"
+    owner: "{{ boxcar_user }}"
+    group: "{{ boxcar_group }}"
+    mode: "0600"
+  notify: restart boxcar-consumer service
+
+# The RSA private key is delivered here already recovered, not
+# bootstrapped on the host. RUNBOOK.md procedure #12
+# (`boxcar -vault keyvault extract -dir`) still happens, but on a
+# workstation, once, via ops/scripts/prepare-ansible-secret.sh — which
+# encrypts the result into an ansible-vault variable instead of leaving
+# anything for this role to derive on the target.
+#
+# That's a deliberate choice, not a limitation worked around: boxcar's
+# password prompt requires a real controlling terminal
+# (golang.org/x/term.ReadPassword in internal/terminal.Prompter), which
+# plain SSH-piped stdin can't satisfy without a pty-allocation trick
+# (expect/script). Rather than take on that dependency here, this role
+# doesn't try to drive the prompt remotely at all — vault.keyvault.json
+# and its password never reach these hosts or this playbook.
+- name: Ensure the recovered private key was supplied
+  ansible.builtin.assert:
+    that: boxcar_recovered_key_pem is defined
+    fail_msg: >-
+      boxcar_recovered_key_pem is not set. Run
+      ops/scripts/prepare-ansible-secret.sh once to produce an
+      ansible-vault-encrypted variable file defining it, then pass it with
+      -e @path/to/vault.yml --ask-vault-pass (or load it from group_vars,
+      see ops/ansible/group_vars/boxcar_hosts/vault.yml.example).
+
+- name: Write the pre-recovered private key
+  ansible.builtin.copy:
+    content: "{{ boxcar_recovered_key_pem }}"
+    dest: "{{ boxcar_home }}/key.pem"
+    owner: "{{ boxcar_user }}"
+    group: "{{ boxcar_group }}"
+    mode: "0600"
+  no_log: true
+  notify: restart boxcar-consumer service
+
+- name: Write environment file for VAULT_KEY_FILE / VAULT_WRAPPED_SECRET
+  ansible.builtin.template:
+    src: boxcar.env.j2
+    dest: "{{ boxcar_home }}/boxcar.env"
+    owner: "{{ boxcar_user }}"
+    group: "{{ boxcar_group }}"
+    mode: "0600"
+  notify: restart boxcar-consumer service

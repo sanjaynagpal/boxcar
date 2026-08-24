@@ -1,0 +1,40 @@
+---
+# Companion to ../scripts/rewrap-after-rotation.sh (RUNBOOK.md procedure
+# #15). After `boxcar rotate`, the old <name>.wrapped.json on every host is
+# orphaned — it still only unwraps the secret that was just rotated away.
+# This play pushes a freshly re-wrapped file out to every host and
+# restarts the consuming service. No password is needed here: cert-wrap
+# already ran locally (that's what rewrap-after-rotation.sh does first).
+#
+# Usage:
+#   ansible-playbook -i inventory.ini redistribute-wrapped.yml \
+#     -e boxcar_vault_name=prod
+
+- name: Redistribute a freshly re-wrapped secret after rotation
+  hosts: boxcar_hosts
+  become: true
+  # Plain defaults, not self-referencing `default()` fallbacks — this play
+  # has no role defaults/ layer underneath it, so a var here that refers to
+  # itself has nothing to fall back to and Ansible rejects it as a
+  # recursive template loop. Override any of these with -e (extra-vars
+  # outranks play vars), e.g. -e boxcar_vault_name=prod-eu.
+  vars:
+    boxcar_vault_name: prod
+    boxcar_home: /etc/boxcar
+    boxcar_user: boxcar
+    boxcar_group: boxcar
+    boxcar_systemd_service: myapp.service
+  tasks:
+    - name: Copy the re-wrapped secret to this host
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../{{ boxcar_vault_name }}.wrapped.json"
+        dest: "{{ boxcar_home }}/{{ boxcar_vault_name }}.wrapped.json"
+        owner: "{{ boxcar_user }}"
+        group: "{{ boxcar_group }}"
+        mode: "0600"
+      notify: restart boxcar-consumer service
+  handlers:
+    - name: restart boxcar-consumer service
+      ansible.builtin.systemd:
+        name: "{{ boxcar_systemd_service }}"
+        state: restarted

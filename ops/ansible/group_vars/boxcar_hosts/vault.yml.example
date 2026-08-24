@@ -1,0 +1,11 @@
+# Example only — NOT what a real vault.yml looks like. A real one is
+# fully ansible-vault-encrypted: the whole file becomes a single opaque
+# $ANSIBLE_VAULT;1.1;AES256 blob after encryption, not readable YAML.
+#
+# Generate the real thing with ops/scripts/prepare-ansible-secret.sh —
+# never hand-author or commit a plaintext version of this file.
+#
+# boxcar_recovered_key_pem: |
+#   -----BEGIN RSA PRIVATE KEY-----
+#   ...
+#   -----END RSA PRIVATE KEY-----

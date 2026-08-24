@@ -9,3 +9,9 @@ vault.*.json.tmp
 
 # Go workspace
 /vendor/
+
+# Ansible: real inventory (may list internal hostnames) and any
+# vault-password file — group_vars/*/vault.yml is fine to commit, it's
+# ansible-vault-encrypted
+ops/ansible/inventory.ini
+ops/ansible/**/vault_pass.txt

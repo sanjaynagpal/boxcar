@@ -1,0 +1,29 @@
+---
+# Provisions a persistent host for unattended boxcar extraction. Wraps
+# RUNBOOK.md procedures #12-13: distributes vault.<name>.json and
+# <name>.wrapped.json, and writes the RSA private key that unwraps it —
+# recovered once, out of band, by ops/scripts/prepare-ansible-secret.sh,
+# not by this playbook.
+#
+# This deliberately does NOT try to drive boxcar's interactive keyvault
+# prompt over SSH: that prompt requires a real controlling terminal
+# (golang.org/x/term.ReadPassword), which plain SSH-piped stdin can't
+# supply without a pty-allocation trick (expect/script). Rather than take
+# on that dependency, the one-time recovery happens on a trusted
+# workstation, and the resulting key is delivered like any other secret:
+# as an ansible-vault-encrypted variable, `boxcar_recovered_key_pem`. No
+# vars_prompt here — nothing in this play is typed interactively.
+#
+# Usage:
+#   ops/scripts/prepare-ansible-secret.sh        # once, produces group_vars/boxcar_hosts/vault.yml
+#   ansible-playbook -i inventory.ini site.yml --ask-vault-pass
+#
+# (group_vars/boxcar_hosts/vault.yml is loaded automatically for hosts in
+# the boxcar_hosts inventory group; --ask-vault-pass decrypts it. See
+# ops/ansible/group_vars/boxcar_hosts/vault.yml.example.)
+
+- name: Provision boxcar secrets for unattended extraction
+  hosts: boxcar_hosts
+  become: true
+  roles:
+    - boxcar_secrets
