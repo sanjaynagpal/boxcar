@@ -29,7 +29,10 @@
 // Normally the secret is read from a real terminal. If VAULT_KEY_FILE (a
 // PEM RSA private key) and VAULT_WRAPPED_SECRET (from cert-wrap) are both
 // set, the secret is unwrapped from those instead — no human needed. See
-// package certkey.
+// package certkey. Alternatively, if HEV_ADDR/HEV_CLIENT_CERT/HEV_CLIENT_KEY/
+// HEV_SECRET_PATH are set, the secret is fetched at run time from HashiCorp
+// Enterprise Vault (HEV) via an mTLS client certificate — no human ever
+// knows the secret at all. See package hevkey.
 package main
 
 import (
@@ -38,6 +41,7 @@ import (
 
 	"github.com/sanjaynagpal/boxcar/internal/certkey"
 	"github.com/sanjaynagpal/boxcar/internal/cli"
+	"github.com/sanjaynagpal/boxcar/internal/hevkey"
 	"github.com/sanjaynagpal/boxcar/internal/terminal"
 	"github.com/sanjaynagpal/boxcar/internal/vault"
 )
@@ -53,25 +57,100 @@ func main() {
 }
 
 // buildPrompter picks how the secret is obtained. Ordinarily that's a real
-// terminal prompt (terminal.Prompter), which requires a human at a TTY. If
-// both $VAULT_KEY_FILE (a PEM RSA private key) and $VAULT_WRAPPED_SECRET
-// (produced by `boxcar cert-wrap`) are set, boxcar unlocks the vault from
-// those instead — no human needed, for CI/cron/deploy scripts. Setting only
-// one of the two is treated as a misconfiguration and fails fast rather
-// than silently falling back to a terminal prompt that would just hang or
-// error in a non-interactive shell.
+// terminal prompt (terminal.Prompter), which requires a human at a TTY.
+// Two non-interactive alternatives are available instead, each gated by its
+// own group of env vars, and each fails fast (exit 2) rather than silently
+// falling back to a terminal prompt that would just hang or error in a
+// non-interactive shell:
+//
+//   - Cert-wrapped secret: if both $VAULT_KEY_FILE (a PEM RSA private key)
+//     and $VAULT_WRAPPED_SECRET (produced by `boxcar cert-wrap`) are set,
+//     the secret is unwrapped from those. A human still had to know the
+//     secret once, to wrap it. See package certkey.
+//   - HEV-backed secret: if $HEV_ADDR, $HEV_CLIENT_CERT, $HEV_CLIENT_KEY,
+//     and $HEV_SECRET_PATH are all set, the secret is fetched fresh from
+//     HashiCorp Enterprise Vault on every run via an mTLS client
+//     certificate — no human ever needs to know it. $HEV_CACERT,
+//     $HEV_SECRET_FIELD, $HEV_AUTH_ROLE, and $HEV_NAMESPACE are optional.
+//     See package hevkey.
+//
+// Setting only part of either group, or fully configuring both groups at
+// once (ambiguous as to which non-interactive source should win), is
+// treated as a misconfiguration.
 func buildPrompter() cli.Prompter {
 	keyFile := os.Getenv("VAULT_KEY_FILE")
 	wrappedFile := os.Getenv("VAULT_WRAPPED_SECRET")
-	switch {
-	case keyFile != "" && wrappedFile != "":
-		return certkey.Prompter{WrappedFile: wrappedFile, KeyFile: keyFile}
-	case keyFile != "" || wrappedFile != "":
+	certWrapConfigured := keyFile != "" && wrappedFile != ""
+	if (keyFile != "") != (wrappedFile != "") {
 		fmt.Fprintln(os.Stderr, "error: VAULT_KEY_FILE and VAULT_WRAPPED_SECRET must both be set together")
 		os.Exit(2)
+	}
+
+	hevAddr := os.Getenv("HEV_ADDR")
+	hevClientCert := os.Getenv("HEV_CLIENT_CERT")
+	hevClientKey := os.Getenv("HEV_CLIENT_KEY")
+	hevSecretPath := os.Getenv("HEV_SECRET_PATH")
+	hevRequired := []string{hevAddr, hevClientCert, hevClientKey, hevSecretPath}
+	hevConfigured := hevAddr != "" && hevClientCert != "" && hevClientKey != "" && hevSecretPath != ""
+	hevAnySet := false
+	for _, v := range hevRequired {
+		if v != "" {
+			hevAnySet = true
+		}
+	}
+	if hevAnySet && !hevConfigured {
+		fmt.Fprintln(os.Stderr, "error: HEV_ADDR, HEV_CLIENT_CERT, HEV_CLIENT_KEY, and HEV_SECRET_PATH must all be set together")
+		os.Exit(2)
+	}
+
+	if certWrapConfigured && hevConfigured {
+		fmt.Fprintln(os.Stderr, "error: cert-wrap env vars (VAULT_KEY_FILE/VAULT_WRAPPED_SECRET) and HEV env vars (HEV_*) cannot both be set")
+		os.Exit(2)
+	}
+
+	if certWrapConfigured {
+		return certkey.Prompter{WrappedFile: wrappedFile, KeyFile: keyFile}
+	}
+	if hevConfigured {
+		return buildHEVPrompter(hevAddr, hevClientCert, hevClientKey, hevSecretPath)
 	}
 	return terminal.Prompter{
 		Out: os.Stderr,
 		FD:  int(os.Stdin.Fd()),
 	}
+}
+
+// buildHEVPrompter reads the client cert/key (and optional CA bundle) from
+// disk and assembles a hevkey.Prompter. It exits like the rest of
+// buildPrompter on any file-read failure, since a misconfigured non-
+// interactive source should fail fast rather than fall back to a prompt.
+func buildHEVPrompter(addr, clientCertFile, clientKeyFile, secretPath string) cli.Prompter {
+	clientCertPEM, err := os.ReadFile(clientCertFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: read HEV_CLIENT_CERT %q: %v\n", clientCertFile, err)
+		os.Exit(2)
+	}
+	clientKeyPEM, err := os.ReadFile(clientKeyFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: read HEV_CLIENT_KEY %q: %v\n", clientKeyFile, err)
+		os.Exit(2)
+	}
+	var caCertPEM []byte
+	if caFile := os.Getenv("HEV_CACERT"); caFile != "" {
+		caCertPEM, err = os.ReadFile(caFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: read HEV_CACERT %q: %v\n", caFile, err)
+			os.Exit(2)
+		}
+	}
+	return hevkey.Prompter{Config: hevkey.Config{
+		Addr:          addr,
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+		CACertPEM:     caCertPEM,
+		SecretPath:    secretPath,
+		SecretField:   os.Getenv("HEV_SECRET_FIELD"),
+		AuthRole:      os.Getenv("HEV_AUTH_ROLE"),
+		Namespace:     os.Getenv("HEV_NAMESPACE"),
+	}}
 }

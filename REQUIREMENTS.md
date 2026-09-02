@@ -145,6 +145,25 @@ deliberate design requirement, not a limitation to work around.
   host/rotation) after which `$VAULT_KEY_FILE`/`$VAULT_WRAPPED_SECRET`
   make every subsequent command against the *data* vault non-interactive.
   See `README.md`'s "Full walkthrough" for the worked example.
+- **Optional: fetch the secret from HashiCorp Enterprise Vault (HEV) via
+  mTLS, so no human ever knows it.** For a shared/service-account vault,
+  setting `$HEV_ADDR`, `$HEV_CLIENT_CERT`, `$HEV_CLIENT_KEY`, and
+  `$HEV_SECRET_PATH` together (all required, or none) makes boxcar fetch
+  the secret at run time from HEV instead of prompting a human or reading
+  cert-wrapped files: it authenticates via HEV's `cert` auth method — an
+  mTLS client certificate presented during the TLS handshake — to obtain a
+  token, then reads the secret from the single configured KV path with it.
+  Optional `$HEV_CACERT` (verify HEV's server certificate; defaults to the
+  system trust store), `$HEV_SECRET_FIELD` (defaults to `secret`),
+  `$HEV_AUTH_ROLE`, and `$HEV_NAMESPACE` (Vault Enterprise namespace) refine
+  this further. See `internal/hevkey`. As with the cert-wrapped case, no
+  other behavior changes — every command works identically regardless of
+  secret source. `$HEV_*` and `$VAULT_KEY_FILE`/`$VAULT_WRAPPED_SECRET` are
+  mutually exclusive; partial configuration of either group, or both groups
+  fully configured at once, is a misconfiguration and fails fast. Because
+  the secret is always whatever HEV currently holds at the configured path,
+  `rotate` against an HEV-backed vault re-seals every entry but does not
+  itself change the underlying secret — that requires updating it in HEV.
 
 ### 6. Multiple named vaults
 - Any vault name matching `[A-Za-z0-9_-]` (max 64 chars) is allowed — e.g.
@@ -200,7 +219,10 @@ boxcar cert-gen <outDir>
 
 `-vault` defaults to `$VAULT_NAME`, then `dev`. Each vault → `vault.<NAME>.json`.
 `$VAULT_KEY_FILE` + `$VAULT_WRAPPED_SECRET` (set together) unlock a vault
-non-interactively instead of prompting a human — see §5.
+non-interactively instead of prompting a human — see §5. Alternatively,
+`$HEV_ADDR` + `$HEV_CLIENT_CERT` + `$HEV_CLIENT_KEY` + `$HEV_SECRET_PATH`
+(set together, and mutually exclusive with the pair above) fetch the secret
+from HashiCorp Enterprise Vault via mTLS instead — see §5.
 
 ## Out of scope / notes
 - There is no persistent audit log or multi-user access control — a vault's

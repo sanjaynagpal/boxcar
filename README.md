@@ -143,6 +143,44 @@ has to happen once per server (or once per key rotation) — every
 subsequent `inject`/`extract`/`rotate` against `prod` on that server runs
 unattended.
 
+### Non-interactive use where nobody knows the secret at all (HashiCorp Enterprise Vault)
+
+Cert-wrap still requires a human to have known the vault's secret once, to
+wrap it. For a shared/team or service-account vault where nobody should ever
+know the secret, boxcar can instead fetch it fresh from HashiCorp Enterprise
+Vault (HEV) on every run, authenticating with an mTLS client certificate
+(HEV's `cert` auth method) — see `internal/hevkey`.
+
+```
+export HEV_ADDR=https://hev.example.com:8200
+export HEV_CLIENT_CERT=./hev-client-cert.pem   # mTLS client cert, issued/trusted by HEV
+export HEV_CLIENT_KEY=./hev-client-key.pem     # matching private key
+export HEV_SECRET_PATH=secret/data/boxcar/prod # KV v2 path holding the vault's secret
+boxcar -vault prod extract db-password ./restored.txt   # no prompt — fetched from HEV
+```
+
+`HEV_ADDR`, `HEV_CLIENT_CERT`, `HEV_CLIENT_KEY`, and `HEV_SECRET_PATH` must
+all be set together. Optional env vars:
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `HEV_CACERT` | PEM CA bundle to verify HEV's server certificate | system trust store |
+| `HEV_SECRET_FIELD` | field name within the KV secret holding the vault's secret | `secret` |
+| `HEV_AUTH_ROLE` | HEV `cert` auth method role name | none |
+| `HEV_NAMESPACE` | Vault Enterprise namespace | none |
+
+These use an `HEV_` prefix rather than `VAULT_*` deliberately, to avoid
+colliding both with boxcar's own `VAULT_NAME`/`VAULT_KEY_FILE`/
+`VAULT_WRAPPED_SECRET` and with the Vault CLI's own `VAULT_ADDR`/`VAULT_CACERT`
+conventions — three unrelated things already share the word "vault" here.
+`HEV_*` and `VAULT_KEY_FILE`/`VAULT_WRAPPED_SECRET` are mutually exclusive;
+setting both groups is treated as a misconfiguration.
+
+Because the fetched secret is whatever HEV currently holds at
+`HEV_SECRET_PATH`, `rotate` against an HEV-backed vault re-seals every entry
+(refreshing salts/nonces) but doesn't actually change the underlying secret —
+rotating the secret itself means updating it in HEV.
+
 ## Security, briefly
 
 - Encryption: AES-256-GCM; key derivation: scrypt with a random per-entry

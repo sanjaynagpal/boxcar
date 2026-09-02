@@ -205,6 +205,38 @@ Copy the backed-up `vault.<NAME>.json` back into the working directory
 you run boxcar from, `chmod 600` it if needed, and use `extract` normally.
 There's no boxcar-side "restore" command — it's just a file.
 
+### 11. Set up a vault where nobody ever knows the secret (HEV-backed technical account)
+
+For a shared/service-account vault, boxcar can fetch the secret at run time
+from HashiCorp Enterprise Vault (HEV) instead of any human typing or
+wrapping it — see `internal/hevkey` and README's "Non-interactive use where
+nobody knows the secret at all" section for the full env var reference.
+
+1. Have your HEV administrator: generate the vault's secret directly inside
+   HEV (never typed by a person), store it at a KV path dedicated to this
+   boxcar vault (e.g. `secret/data/boxcar/prod`), and issue/trust an mTLS
+   client certificate for boxcar to authenticate with via HEV's `cert` auth
+   method.
+2. On the machine(s) that will run boxcar, set:
+   ```
+   export HEV_ADDR=https://hev.example.com:8200
+   export HEV_CLIENT_CERT=./hev-client-cert.pem
+   export HEV_CLIENT_KEY=./hev-client-key.pem
+   export HEV_SECRET_PATH=secret/data/boxcar/prod
+   ```
+3. Run `boxcar -vault prod list` (or any command) to confirm boxcar can
+   authenticate and fetch the secret — no prompt should appear.
+4. **Rotation works differently here.** `boxcar -vault prod rotate` still
+   re-seals every entry (refreshing salts/nonces, and upgrading KDF cost if
+   applicable, same as procedure #6) — but since the secret it fetches for
+   both "current" and "new" comes from the same HEV path, it does **not**
+   change the underlying secret. To actually rotate an HEV-backed vault's
+   secret: update the secret's value in HEV first, then run `boxcar rotate`
+   so every entry is re-sealed under the new value.
+5. Treat `HEV_CLIENT_CERT`/`HEV_CLIENT_KEY` with the same care as any other
+   credential material — anyone holding a trusted client cert/key can fetch
+   the vault's secret from HEV on demand.
+
 ---
 
 ## Choosing secrets

@@ -375,6 +375,48 @@ use, which led to implementing the certificate-wrapped option below.
   provide the vault's existing secret once, interactively — what it
   removes is the *ongoing* need for a human on every subsequent
   `extract`/`inject`/`rotate` in CI/cron/deploy contexts.
+- **External secrets-manager fetch (HashiCorp Enterprise Vault) —
+  implemented**, `internal/hevkey`. Prompted by the "non-person technical
+  account" scenario: a shared/service-account boxcar vault whose secret
+  should never be known by *any* human, not even the one who set it up (the
+  gap `certkey` leaves — its wrapped secret still traces back to a human
+  typing it once). `hevkey.Prompter` fetches the secret fresh from HEV on
+  every call: it authenticates via HEV's `cert` auth method (an mTLS client
+  certificate presented during the TLS handshake, not signed by boxcar or
+  compared against anything boxcar stores) to obtain a short-lived token,
+  then reads one KV secret at a configured path with it — the secret's
+  entire lifecycle (generation, storage, access control, rotation) lives in
+  HEV, outside boxcar. Env vars are prefixed `HEV_` rather than `VAULT_*`
+  specifically to avoid a three-way collision: boxcar's own `VAULT_NAME`/
+  `VAULT_KEY_FILE`/`VAULT_WRAPPED_SECRET`, the Vault CLI's own conventional
+  `VAULT_ADDR`/`VAULT_CACERT`/etc., and this feature's config would
+  otherwise all compete for the same namespace. `HEV_*` and
+  `VAULT_KEY_FILE`/`VAULT_WRAPPED_SECRET` are mutually exclusive in
+  `buildPrompter` (`cmd/boxcar/main.go`) — both being configured at once is
+  treated as a misconfiguration, not resolved by a precedence rule, since
+  there's no principled way to guess which non-interactive source the
+  operator meant.
+
+  **Deliberately hand-rolled, not `github.com/hashicorp/vault/api`.** The
+  login (`POST /v1/auth/cert/login`) and secret-read (`GET /v1/<path>`)
+  calls are implemented directly with `net/http`/`crypto/tls`, the same way
+  `certkey` hand-implements its RSA/AES-GCM envelope rather than depending
+  on a crypto library — it keeps boxcar's dependency footprint at two small
+  modules (`x/crypto`, `x/term`) rather than pulling in HashiCorp's full SDK
+  and its transitive dependencies for what is, from boxcar's side, two HTTP
+  calls. The cost is that `hevkey` owns getting protocol details right
+  itself (e.g. KV v1 vs v2 response shape, which it detects by checking for
+  a nested `data` object rather than requiring the caller to specify a KV
+  version).
+
+  **`rotate` against an HEV-backed vault doesn't rotate the secret itself**
+  — a limitation of any `Prompter` that isn't backed by live human input,
+  not something specific to HEV. `App.rotate` calls `Prompt` twice (current,
+  then new); since `hevkey.Prompter.Prompt` always returns whatever HEV
+  currently holds at the configured path, both calls return the same value.
+  `rotate` still re-seals every entry (fresh salts/nonces, current KDF cost)
+  but the underlying secret is unchanged until it's updated in HEV directly
+  — see `RUNBOOK.md` procedure #11.
 - **OS keychain integration** (macOS Keychain / Windows Credential Manager
   / Linux Secret Service, e.g. via `github.com/zalando/go-keyring`). Boxcar
   would store the vault secret there instead of prompting for it; unlocking
